@@ -1,4 +1,5 @@
 import os
+os.system("pip install fastapi uvicorn telethon gradio nest_asyncio > /dev/null 2>&1")
 import asyncio
 import nest_asyncio
 import gradio as gr
@@ -58,7 +59,7 @@ iface = gr.Interface(
     outputs="text",
     title="🔴 Désabonnement Telegram",
     description="Entrez votre numéro pour vous désabonner de toutes les chaînes Telegram.",
-    allow_flagging="never"
+    flagging_mode="never"
 )
 
 # Run FastAPI with Gradio
