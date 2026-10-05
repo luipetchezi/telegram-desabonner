@@ -1,44 +1,93 @@
 import os
-import asyncio
 
 import gradio as gr
-import nest_asyncio
 from fastapi import FastAPI
 from telethon import TelegramClient
-from telethon.errors import PhoneNumberInvalidError
-
-# Only needed if this code runs inside an already active event loop
-nest_asyncio.apply()
+from telethon.errors import (
+    PhoneCodeInvalidError,
+    PhoneNumberInvalidError,
+    SessionPasswordNeededError,
+)
 
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0") or 0)
 API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME", "telegram_unsubscribe")
 
-# FastAPI app
 app = FastAPI(title="Telegram Unsubscribe")
+
+AUTH_STATE = {
+    "client": None,
+    "phone": None,
+    "code_sent": False,
+}
 
 
 def validate_phone(phone_number: str) -> bool:
     return bool(phone_number) and phone_number.startswith("+") and len(phone_number) >= 10
 
 
-async def unsubscribe_telegram(phone_number: str) -> str:
-    """
-    Connects to Telegram, unsubscribes from all channels, and logs out.
-    """
+async def _get_client():
+    if AUTH_STATE["client"] is None:
+        AUTH_STATE["client"] = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+    return AUTH_STATE["client"]
+
+
+async def send_code(phone_number: str):
     if not validate_phone(phone_number):
-        return "❌ Numéro invalide. Entrez un numéro avec l'indicatif international (ex: +225XXXXXXXXXX)."
+        return "❌ Numéro invalide. Entrez un numéro international valide (ex: +225XXXXXXXXXX)."
 
     if not API_ID or not API_HASH:
         return "❌ Configurez TELEGRAM_API_ID et TELEGRAM_API_HASH dans votre environnement."
 
-    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+    try:
+        client = await _get_client()
+        await client.connect()
+        await client.send_code_request(phone_number)
+        AUTH_STATE["phone"] = phone_number
+        AUTH_STATE["code_sent"] = True
+        return "✅ Code envoyé. Entrez le code reçu de Telegram, puis cliquez sur 'Se connecter'."
+    except PhoneNumberInvalidError:
+        return "❌ Numéro de téléphone invalide."
+    except Exception as exc:
+        return f"❌ Erreur lors de l'envoi du code: {exc}"
+
+
+async def login(phone_number: str, code: str, password: str):
+    if not validate_phone(phone_number):
+        return "❌ Numéro invalide."
+
+    if not code:
+        return "❌ Entrez le code reçu sur Telegram avant de vous connecter."
+
+    client = await _get_client()
 
     try:
         await client.connect()
+        if password:
+            await client.sign_in(phone_number, code, password=password)
+        else:
+            await client.sign_in(phone_number, code)
 
+        if await client.is_user_authorized():
+            AUTH_STATE["phone"] = phone_number
+            AUTH_STATE["code_sent"] = False
+            return "✅ Connexion réussie. Vous pouvez maintenant désabonner des chaînes."
+        return "❌ La connexion n'a pas été confirmée."
+    except SessionPasswordNeededError:
+        return "⚠️ Votre compte Telegram utilise une authentification à deux facteurs. Entrez votre mot de passe puis réessayez."
+    except PhoneCodeInvalidError:
+        return "❌ Code de vérification invalide. Demandez un nouveau code et réessayez."
+    except Exception as exc:
+        return f"❌ Erreur lors de la connexion: {exc}"
+
+
+async def unsubscribe_all():
+    client = await _get_client()
+
+    try:
+        await client.connect()
         if not await client.is_user_authorized():
-            return "❌ Session Telegram non autorisée. Authentifiez-vous depuis Telegram avant de relancer l'opération."
+            return "❌ Vous n'êtes pas connecté à Telegram. Connectez-vous d'abord."
 
         dialogs = await client.get_dialogs()
         channels = [
@@ -56,29 +105,35 @@ async def unsubscribe_telegram(phone_number: str) -> str:
 
         await client.log_out()
         return f"✅ {deleted_count} chaînes supprimées. Déconnecté de Telegram."
-    except PhoneNumberInvalidError:
-        return "❌ Numéro de téléphone invalide."
     except Exception as exc:
         return f"❌ Erreur: {exc}"
     finally:
-        await client.disconnect()
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
 
 
-# Gradio UI
+with gr.Blocks(title="Désabonnement Telegram") as demo:
+    gr.Markdown("# Désabonnement Telegram\nConnectez-vous à Telegram pour supprimer toutes les chaînes auxquelles vous êtes abonné.")
 
-def web_interface(phone_number: str):
-    return asyncio.run(unsubscribe_telegram(phone_number))
+    with gr.Row():
+        phone = gr.Textbox(label="📱 Numéro de téléphone", placeholder="+225XXXXXXXXXX")
 
+    with gr.Row():
+        code = gr.Textbox(label="🔐 Code reçu (si demandé)", placeholder="12345")
+        password = gr.Textbox(label="🔒 Mot de passe (2FA, optionnel)", type="password", placeholder="Laissez vide si vous n'avez pas de 2FA")
 
-iface = gr.Interface(
-    fn=web_interface,
-    inputs=gr.Textbox(label="📱 Numéro de téléphone (+225XXXXXXXXXX)"),
-    outputs="text",
-    title="🔴 Désabonnement Telegram",
-    description="Entrez votre numéro pour vous désabonner de toutes les chaînes Telegram.",
-    flagging_mode="never",
-    allow_flagging=False,
-)
+    status = gr.Textbox(label="Statut", lines=5)
+
+    with gr.Row():
+        send_code_btn = gr.Button("Envoyer le code")
+        login_btn = gr.Button("Se connecter")
+        unsubscribe_btn = gr.Button("Désabonner")
+
+    send_code_btn.click(send_code, inputs=phone, outputs=status)
+    login_btn.click(login, inputs=[phone, code, password], outputs=status)
+    unsubscribe_btn.click(unsubscribe_all, inputs=None, outputs=status)
 
 
 @app.get("/")
